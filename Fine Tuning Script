@@ -1,0 +1,103 @@
+# ==============================================================================
+# 1. THE OMNI-REPAIR SHIELD (STILL NEEDED FOR YOUR ENVIRONMENT)
+# ==============================================================================
+import os
+import sys
+import torch
+import torch.nn as nn
+from types import ModuleType
+
+def _set_submodule(self, target, module):
+    if "." not in target:
+        setattr(self, target, module)
+        return
+    atoms = target.split(".")
+    parent = self.get_submodule(".".join(atoms[:-1]))
+    setattr(parent, atoms[-1], module)
+
+if not hasattr(nn.Module, "set_submodule"):
+    nn.Module.set_submodule = _set_submodule
+
+sys.modules["torchao"] = None 
+
+for dtype_name in ["int1", "int2", "int3", "int4", "int5", "int6", "int7"]:
+    if not hasattr(torch, dtype_name):
+        setattr(torch, dtype_name, torch.int8)
+
+try:
+    import torch._inductor
+    if not hasattr(torch._inductor, "config"):
+        import torch._inductor.config as config
+        torch._inductor.config = config
+except Exception:
+    mock_config = ModuleType("config")
+    torch._inductor.config = mock_config
+
+os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
+
+# ==============================================================================
+# 2. OPTIMIZED LLAMATRON TRAINING (2048 SEQ + BATCH 16)
+# ==============================================================================
+from unsloth import FastLanguageModel
+from datasets import load_dataset
+from trl import SFTTrainer, SFTConfig
+
+# SETTINGS
+DATASET_PATH   = "/home/Dataset/medical_reasoning_sft.jsonl"
+OUTPUT_DIR     = "/home/Trained Files"
+MAX_SEQ_LENGTH = 2048  # <--- OPTIMIZED: Cuts VRAM usage in half
+
+print("🚀 INITIALIZING OPTIMIZED LLAMATRON ON RTX A6000...")
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name     = "unsloth/Llama-3.2-1B-Instruct",
+    max_seq_length = MAX_SEQ_LENGTH,
+    dtype          = torch.bfloat16, 
+    load_in_4bit   = True,
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 32, 
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_alpha = 64,
+    use_gradient_checkpointing = "unsloth",
+    random_state = 42,
+)
+
+# LOAD DATASET
+dataset = load_dataset("json", data_files=DATASET_PATH, split="train")
+dataset = dataset.map(lambda x: {"text": tokenizer.apply_chat_template(x["messages"], tokenize=False)}, num_proc=8)
+
+# THE TRAINER: BALANCED FOR SPEED AND 48GB VRAM
+trainer = SFTTrainer(
+    model = model,
+    tokenizer = tokenizer,
+    train_dataset = dataset,
+    dataset_text_field = "text",
+    max_seq_length = MAX_SEQ_LENGTH,
+    packing = True, # <--- CRITICAL: Stitches multiple samples into 2048 blocks
+    args = SFTConfig(
+        output_dir = OUTPUT_DIR,
+        num_train_epochs = 1,
+        per_device_train_batch_size = 16, # <--- FASTER: More parallel samples
+        gradient_accumulation_steps = 2,  # <--- BALANCED: Total Batch Size = 32
+        learning_rate = 2e-4,
+        bf16 = True,
+        optim = "adamw_8bit",
+        weight_decay = 0.01,
+        save_strategy = "steps",
+        save_steps = 2000,                # Save less often to avoid disk lag
+        save_total_limit = 2,             # <--- SAFETY: Deletes old checkpoints to save disk
+        logging_steps = 10,
+        report_to = "none",
+    ),
+)
+
+print("\n🔥 LAUNCHING HIGH-SPEED TRAINING...")
+trainer.train()
+
+# SAVE FINAL MERGED MODEL
+final_path = os.path.join(OUTPUT_DIR, "llama_medical_2048_final")
+model.save_pretrained_merged(final_path, tokenizer, save_method="merged_16bit")
+print(f"✅ FINISHED. Model saved to {final_path}")
