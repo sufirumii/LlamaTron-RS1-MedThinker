@@ -1,6 +1,4 @@
-# ==============================================================================
-# 1. THE OMNI-REPAIR SHIELD (STILL NEEDED FOR YOUR ENVIRONMENT)
-# ==============================================================================
+
 import os
 import sys
 import torch
@@ -35,9 +33,7 @@ except Exception:
 
 os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
 
-# ==============================================================================
-# 2. OPTIMIZED LLAMATRON TRAINING (2048 SEQ + BATCH 16)
-# ==============================================================================
+----------------------------------------------------------------------------
 from unsloth import FastLanguageModel
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
