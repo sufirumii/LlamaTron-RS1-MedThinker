@@ -1,0 +1,413 @@
+# ==============================================================================
+# LLAMATRON RS1 MEDTHINKER — JUPYTER NOTEBOOK INTERFACE
+# pip install: ipywidgets
+# ==============================================================================
+import os
+import sys
+import torch
+
+# --- Compatibility Patches ---
+for attr in ["int1","int2","int3","int4","int5","int6","int7"]:
+    if not hasattr(torch, attr): setattr(torch, attr, torch.int8)
+for attr in ["uint1","uint2","uint3","uint4"]:
+    if not hasattr(torch, attr): setattr(torch, attr, torch.uint8)
+sys.modules["torchao"] = None
+
+import ipywidgets as widgets
+from IPython.display import display, HTML, clear_output
+from transformers import AutoTokenizer, LlamaForCausalLM
+
+# ==============================================================================
+# MODEL LOADING — LlamaTron RS1 MedThinker
+# ==============================================================================
+MODEL_PATH = "/home/Trained Files/llama_medical_2048_final"
+
+MAX_NEW_TOKENS     = 512
+TEMPERATURE        = 0.35
+TOP_P              = 0.85
+REPETITION_PENALTY = 1.2
+
+# Few-shot example baked into every prompt to enforce structured output
+FEW_SHOT_EXAMPLE = """\
+CASE: 2yo girl, high fever, tugging right ear, irritable, not sleeping.
+
+DIAGNOSIS: Acute otitis media (AOM). Differentials: otitis externa, teething.
+
+REASONING: Unilateral ear tugging with fever and irritability in a toddler is the classic AOM presentation. The age group (6mo–2yr) has the highest incidence due to horizontal Eustachian tube anatomy, which impairs drainage.
+
+IMMEDIATE TREATMENT:
+- Amoxicillin 90mg/kg/day divided BID x 10 days (first-line)
+- Ibuprofen/paracetamol for pain and fever
+- Re-evaluate in 48–72h if no improvement
+
+RED FLAGS / ESCALATION: Refer immediately if mastoid swelling, facial palsy, or no improvement after 72h of antibiotics."""
+
+SYSTEM_PROMPT = "You are LlamaTron RS1 MedThinker, a clinical medical assistant that reasons step-by-step through cases. Always answer using the exact structured format shown, with clear DIAGNOSIS, REASONING, IMMEDIATE TREATMENT, and RED FLAGS sections."
+
+def build_prompt(user_question: str) -> str:
+    few_shot_user = f"Answer this medical case in structured format:\n\n{FEW_SHOT_EXAMPLE}"
+    return (
+        f"<|begin_of_text|>"
+        f"<|start_header_id|>system<|end_header_id|>\n{SYSTEM_PROMPT}<|eot_id|>"
+        f"<|start_header_id|>user<|end_header_id|>\n{few_shot_user}<|eot_id|>"
+        f"<|start_header_id|>assistant<|end_header_id|>\n{FEW_SHOT_EXAMPLE}<|eot_id|>"
+        f"<|start_header_id|>user<|end_header_id|>\nCASE: {user_question}<|eot_id|>"
+        f"<|start_header_id|>assistant<|end_header_id|>\n"
+    )
+
+def run_inference(question: str) -> str:
+    prompt = build_prompt(question)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[1]
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens     = MAX_NEW_TOKENS,
+            temperature        = TEMPERATURE,
+            top_p              = TOP_P,
+            do_sample          = True,
+            repetition_penalty = REPETITION_PENALTY,
+            pad_token_id       = tokenizer.eos_token_id,
+            eos_token_id       = tokenizer.eos_token_id,
+        )
+    raw = tokenizer.decode(out[0][input_len:], skip_special_tokens=False)
+    for stop in ["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"]:
+        if stop in raw:
+            raw = raw[:raw.index(stop)]
+    return raw.strip()
+
+def format_answer_html(raw: str) -> str:
+    """Convert structured plain-text answer to styled HTML."""
+    section_colors = {
+        "DIAGNOSIS":           ("#00ff96", "🔬"),
+        "REASONING":           ("#00cfff", "🧠"),
+        "IMMEDIATE TREATMENT": ("#ffcc00", "💊"),
+        "RED FLAGS":           ("#ff4d6d", "🚨"),
+    }
+    lines = raw.splitlines()
+    html_parts = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            html_parts.append("<div style='height:10px'></div>")
+            continue
+        matched = False
+        for key, (color, icon) in section_colors.items():
+            if stripped.upper().startswith(key):
+                # Section header
+                rest = stripped[len(key):].lstrip(": ")
+                html_parts.append(f"""
+                    <div style='margin:18px 0 8px;'>
+                        <span style='font-family:"Share Tech Mono",monospace;font-size:13px;
+                        letter-spacing:3px;color:{color};font-weight:700;'>
+                        {icon} {key}</span>
+                        {"<span style='font-family:Rajdhani,sans-serif;font-size:19px;color:#e8f8ff;margin-left:8px;'>: " + rest + "</span>" if rest else ""}
+                    </div>""")
+                matched = True
+                break
+        if not matched:
+            if stripped.startswith("-"):
+                content = stripped[1:].strip()
+                html_parts.append(f"""
+                    <div style='display:flex;gap:10px;margin:6px 0 6px 12px;'>
+                        <span style='color:#00ff96;font-size:20px;line-height:1.4;'>›</span>
+                        <span style='font-family:Rajdhani,sans-serif;font-size:19px;
+                        color:#cce8ff;line-height:1.6;'>{content}</span>
+                    </div>""")
+            else:
+                html_parts.append(f"""
+                    <div style='font-family:Rajdhani,sans-serif;font-size:19px;
+                    color:#cce8ff;line-height:1.7;margin:4px 0;'>{stripped}</div>""")
+    return "\n".join(html_parts)
+
+# ==============================================================================
+# LOAD MODEL
+# ==============================================================================
+print("⚡ Loading LlamaTron RS1 MedThinker...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+model = LlamaForCausalLM.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+model.eval()
+print("✅ Model ready!\n")
+
+# ==============================================================================
+# UI
+# ==============================================================================
+display(HTML("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&family=Share+Tech+Mono&display=swap');
+
+#lt-wrap {
+    background: #000;
+    background-image:
+        radial-gradient(ellipse at 20% 50%, #0a0a2e 0%, transparent 55%),
+        radial-gradient(ellipse at 80% 20%, #1a0a1a 0%, transparent 55%),
+        radial-gradient(ellipse at 50% 85%, #001a10 0%, transparent 55%);
+    padding: 48px 36px 60px;
+    font-family: 'Rajdhani', sans-serif;
+    position: relative;
+    border-radius: 10px;
+    border: 1px solid rgba(0,255,150,0.12);
+}
+#lt-wrap::before {
+    content: '';
+    position: absolute; inset: 0; border-radius: 10px;
+    background-image:
+        linear-gradient(rgba(0,255,150,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,255,150,0.025) 1px, transparent 1px);
+    background-size: 50px 50px;
+    pointer-events: none;
+}
+#lt-inner { max-width: 900px; margin: 0 auto; position: relative; z-index: 1; }
+
+.lt-badge {
+    display: inline-block;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px;
+    color: #00ff96;
+    letter-spacing: 6px;
+    border: 1px solid rgba(0,255,150,0.35);
+    padding: 8px 24px;
+    margin-bottom: 22px;
+}
+.lt-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 62px;
+    font-weight: 900;
+    letter-spacing: 5px;
+    margin: 0 0 6px;
+    background: linear-gradient(135deg, #fff 0%, #00ff96 40%, #00cfff 70%, #fff 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    filter: drop-shadow(0 0 40px rgba(0,255,150,0.45));
+}
+.lt-sub {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 16px;
+    color: #00cfff;
+    letter-spacing: 10px;
+    margin-bottom: 8px;
+}
+.lt-tag {
+    font-family: 'Rajdhani', sans-serif;
+    font-size: 17px;
+    color: rgba(255,255,255,0.38);
+    letter-spacing: 3px;
+    margin: 0;
+}
+.lt-stats {
+    display: flex;
+    gap: 18px;
+    margin: 34px 0;
+}
+.lt-stat {
+    flex: 1;
+    background: rgba(0,0,0,0.35);
+    border: 1px solid rgba(255,255,255,0.07);
+    padding: 18px 10px;
+    text-align: center;
+    border-radius: 4px;
+    transition: border-color 0.3s;
+}
+.lt-stat:hover { border-color: rgba(0,255,150,0.3); }
+.lt-stat-v {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 22px;
+    font-weight: 700;
+    color: #00ff96;
+    display: block;
+}
+.lt-stat-l {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    color: rgba(255,255,255,0.32);
+    letter-spacing: 2px;
+    display: block;
+    margin-top: 6px;
+}
+.lt-divider {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    margin: 22px 0 32px;
+}
+.lt-div-line {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(0,255,150,0.5), transparent);
+}
+.lt-label {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px;
+    color: #00ff96;
+    letter-spacing: 4px;
+    margin-bottom: 14px;
+    opacity: 0.85;
+}
+
+/* Override Jupyter widget styles */
+.widget-textarea textarea {
+    background: rgba(0,5,15,0.85) !important;
+    border: 1px solid rgba(0,255,150,0.25) !important;
+    border-radius: 4px !important;
+    color: #e8f8ff !important;
+    font-family: 'Rajdhani', sans-serif !important;
+    font-size: 18px !important;
+    letter-spacing: 0.5px !important;
+    padding: 16px !important;
+    outline: none !important;
+    line-height: 1.6 !important;
+    resize: vertical !important;
+}
+.widget-textarea textarea:focus {
+    border-color: rgba(0,255,150,0.6) !important;
+    box-shadow: 0 0 20px rgba(0,255,150,0.1) !important;
+}
+.widget-textarea textarea::placeholder { color: rgba(255,255,255,0.2) !important; }
+
+.widget-button button {
+    background: linear-gradient(135deg, rgba(0,255,150,0.12), rgba(0,207,255,0.08)) !important;
+    border: 1px solid rgba(0,255,150,0.45) !important;
+    border-radius: 4px !important;
+    color: #00ff96 !important;
+    font-family: 'Orbitron', sans-serif !important;
+    font-size: 15px !important;
+    font-weight: 700 !important;
+    letter-spacing: 5px !important;
+    cursor: pointer !important;
+    transition: all 0.25s !important;
+}
+.widget-button button:hover {
+    background: linear-gradient(135deg, rgba(0,255,150,0.22), rgba(0,207,255,0.15)) !important;
+    box-shadow: 0 0 30px rgba(0,255,150,0.2) !important;
+    transform: translateY(-1px) !important;
+}
+</style>
+
+<div id="lt-wrap"><div id="lt-inner">
+  <div style="text-align:center; margin-bottom:40px;">
+    <div class="lt-badge">Medical AI System · v2.0 · MedThinker Edition</div>
+    <h1 class="lt-title">LLAMATRON</h1>
+    <div class="lt-sub">RS1 · MEDTHINKER</div>
+    <p class="lt-tag">Step-by-Step Clinical Reasoning · Llama 3.2 1B · Fine-Tuned</p>
+  </div>
+
+  <div class="lt-stats">
+    <div class="lt-stat">
+      <span class="lt-stat-v">1B</span>
+      <span class="lt-stat-l">Parameters</span>
+    </div>
+    <div class="lt-stat">
+      <span class="lt-stat-v">810K</span>
+      <span class="lt-stat-l">Training Samples</span>
+    </div>
+    <div class="lt-stat">
+      <span class="lt-stat-v">SFT</span>
+      <span class="lt-stat-l">Fine-Tune Method</span>
+    </div>
+    <div class="lt-stat">
+      <span class="lt-stat-v">BF16</span>
+      <span class="lt-stat-l">Precision</span>
+    </div>
+    <div class="lt-stat">
+      <span class="lt-stat-v">2048</span>
+      <span class="lt-stat-l">Context Length</span>
+    </div>
+  </div>
+
+  <div class="lt-divider">
+    <div class="lt-div-line"></div>
+    <span style="color:#00ff96; font-size:18px;">⬡</span>
+    <div class="lt-div-line"></div>
+  </div>
+
+  <div class="lt-label">◈ Clinical Query Input</div>
+</div></div>
+"""))
+
+# ==============================================================================
+# INPUT WIDGETS
+# ==============================================================================
+question_input = widgets.Textarea(
+    placeholder='Enter clinical case or medical question here...\n\nExample: 3yo boy, barking cough, stridor, worse at night.',
+    layout=widgets.Layout(width='100%', height='140px')
+)
+
+submit_btn = widgets.Button(
+    description='TRANSMIT QUERY',
+    layout=widgets.Layout(width='100%', height='58px', margin='16px 0 0 0'),
+)
+
+answer_output = widgets.Output()
+
+display(question_input, submit_btn, answer_output)
+
+# ==============================================================================
+# CLICK HANDLER
+# ==============================================================================
+def on_click(b):
+    question = question_input.value.strip()
+    if not question:
+        return
+
+    submit_btn.disabled = True
+    submit_btn.description = 'PROCESSING...'
+
+    with answer_output:
+        clear_output(wait=True)
+        display(HTML("""
+            <div style="font-family:'Share Tech Mono',monospace; font-size:15px;
+            letter-spacing:4px; text-align:center; padding:18px; margin-top:14px;
+            color:#ffcc00; border:1px solid rgba(255,204,0,0.4);
+            background:rgba(255,204,0,0.06); border-radius:4px;">
+            ⟳ &nbsp;&nbsp; NEURAL PROCESSING — CLINICAL REASONING IN PROGRESS...
+            </div>
+        """))
+
+    # Run inference
+    try:
+        answer_raw = run_inference(question)
+        answer_html = format_answer_html(answer_raw)
+
+        with answer_output:
+            clear_output(wait=True)
+            display(HTML(f"""
+                <div style="background:rgba(0,0,0,0.85); border:1px solid rgba(0,207,255,0.3);
+                border-radius:6px; padding:30px 34px; margin-top:16px;
+                box-shadow: 0 0 40px rgba(0,207,255,0.06);">
+                    <div style="font-family:'Share Tech Mono',monospace; font-size:12px;
+                    color:#00cfff; letter-spacing:5px; margin-bottom:20px; opacity:0.9;">
+                    ◈ &nbsp;MedThinker Clinical Assessment</div>
+                    <div style="border-top:1px solid rgba(0,207,255,0.15); padding-top:20px;">
+                        {answer_html}
+                    </div>
+                    <div style="margin-top:24px; padding-top:16px;
+                    border-top:1px solid rgba(255,255,255,0.06);
+                    font-family:'Share Tech Mono',monospace; font-size:11px;
+                    color:rgba(255,255,255,0.2); letter-spacing:3px; text-align:right;">
+                    LlamaTron RS1 MedThinker · For educational use only · Always consult a physician
+                    </div>
+                </div>
+            """))
+
+    except Exception as e:
+        with answer_output:
+            clear_output(wait=True)
+            display(HTML(f"""
+                <div style="background:rgba(20,0,0,0.85); border:1px solid rgba(255,77,109,0.4);
+                border-radius:6px; padding:24px 28px; margin-top:14px;">
+                    <div style="font-family:'Share Tech Mono',monospace; font-size:13px;
+                    color:#ff4d6d; letter-spacing:3px;">⚠ INFERENCE ERROR</div>
+                    <div style="font-family:'Rajdhani',sans-serif; font-size:17px;
+                    color:#ffaaaa; margin-top:12px;">{str(e)}</div>
+                </div>
+            """))
+
+    submit_btn.disabled = False
+    submit_btn.description = 'TRANSMIT QUERY'
+
+submit_btn.on_click(on_click)
